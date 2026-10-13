@@ -253,6 +253,7 @@ hr { border: 0; border-top: 1px solid var(--border); margin: 4px 0; width: 100%;
   <div class="meta">
     <div class="pill"><span>racha</span><b id="streak">0</b></div>
     <div class="pill"><span>día</span><b id="dayidx">1</b><i>/730</i></div>
+    <button class="ghost" id="btnAudio">🔇 Iniciar audio</button>
     <button class="ghost" id="btnVocab">Biblioteca</button>
     <button class="ghost" id="btnStats">Stats</button>
     <button class="ghost" id="btnSettings">Ajustes</button>
@@ -276,7 +277,7 @@ hr { border: 0; border-top: 1px solid var(--border); margin: 4px 0; width: 100%;
     <div class="panel-head"><h2><em>01</em> Dictado estricto</h2><span class="tag" id="b1meta"></span></div>
     <div class="controls">
       <button id="b1play" class="primary">▶ Escuchar <kbd>Ctrl+Espacio</kbd></button>
-      <button id="b1slow">🐢 Lento 0.7×</button>
+      <button id="b1slow">🐢 Lento 0.5×</button>
       <span class="muted" id="b1replays"></span>
     </div>
     <textarea id="b1input" rows="3" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off"
@@ -340,7 +341,7 @@ hr { border: 0; border-top: 1px solid var(--border); margin: 4px 0; width: 100%;
     <details class="tr-toggle"><summary>Traducción</summary><p id="b3tr"></p></details>
     <div class="controls">
       <button id="b3play" class="primary">▶ Escuchar <kbd>Ctrl+Espacio</kbd></button>
-      <button id="b3slow">🐢 Lento</button>
+      <button id="b3slow">🐢 Lento 0.5×</button>
       <button id="b3rec" class="rec">● Grabar <kbd>Ctrl+Enter</kbd></button>
       <button id="b3mine" hidden>▶ Mi grabación</button>
       <button id="b3next" hidden>Siguiente →</button>
@@ -428,8 +429,8 @@ hr { border: 0; border-top: 1px solid var(--border); margin: 4px 0; width: 100%;
     <label>Tarjetas nuevas por día <input id="setNew" type="number" min="0" max="100"></label>
     <label>El día de estudio arranca a las (hora) <input id="setHour" type="number" min="0" max="12"></label>
     <label>Largo máximo de frase (palabras) <small class="muted">Sube solo cuando acertás seguido · 4 a 40</small><input id="setCap" type="number" min="4" max="40"></label>
-    <label>Voz TTS <select id="setVoice"></select></label>
-    <label>Velocidad TTS <span id="rateVal"></span><input id="setRate" type="range" min="0.6" max="1.3" step="0.05"></label>
+    <label>Voz TTS <select id="setVoice"></select> <button type="button" id="setTest">▶ Probar voz</button> <small class="muted">Para una voz más natural en Mac: Ajustes del Sistema → Accesibilidad → Contenido hablado → Voz del sistema → Administrar voces → Inglés → bajá «Ava (Premium)» o «Zoe (Premium)». En Chrome también aparecen las voces «Google» (online).</small></label>
+    <label>Velocidad TTS <span id="rateVal"></span><input id="setRate" type="range" min="0.5" max="1.3" step="0.05"></label>
     <label>Importar paquete de contenido (.json) <input id="setImport" type="file" accept=".json,application/json"></label>
     <p class="muted small" id="importMsg"></p>
     <hr>
@@ -497,9 +498,19 @@ const LocalAPI = (() => {
     try { const raw = localStorage.getItem(KEY); DB = raw ? JSON.parse(raw) : null; } catch { DB = null; }
     if (!DB || DB.v !== 1) DB = DB && DB.v === 1 ? DB : emptyDB();
   }
+  let onSave = null;
   function save() {
-    try { localStorage.setItem(KEY, JSON.stringify(DB)); }
-    catch (e) { throw new ApiError(507, 'No se pudo guardar en el navegador (almacenamiento lleno o bloqueado).'); }
+    DB.saved_at = Date.now();
+    let raw;
+    try { raw = JSON.stringify(DB); localStorage.setItem(KEY, raw); }
+    catch (e) { if (onSave) onSave(raw || null, false); throw new ApiError(507, 'No se pudo guardar en el navegador (almacenamiento lleno o bloqueado). Exportá un backup en Ajustes.'); }
+    if (onSave) onSave(raw, true);
+  }
+  /** Cantidad de actividad real guardada (0 = base de datos "virgen"). */
+  function progressOf(d) {
+    if (!d) return 0;
+    const secs = Object.values(d.block_time || {}).reduce((a, b) => a + (b.seconds || 0), 0);
+    return (d.attempts || []).length + (secs >= 30 ? 1 : 0) + (d.cards || []).filter(c => c.reps > 0).length;
   }
   const nextId = t => (DB.seq[t] = (DB.seq[t] || 0) + 1);
 
@@ -1240,7 +1251,7 @@ const LocalAPI = (() => {
     return JSON.parse(JSON.stringify(out));
   }
 
-  return { init, call, ApiError };
+  return { init, call, ApiError, progressOf, setOnSave: fn => { onSave = fn; }, current: () => DB };
 })();
 
 /* =====================================================================
@@ -1435,35 +1446,82 @@ function showBlock(n) {
 }
 
 /* ---------------------------------------------------------- TTS local */
+const SLOW = 0.5;                       // velocidad del botón "Lento"
 const TTS = {
   voices: [],
+  on: false,                            // el audio automático arranca apagado en cada apertura
   load() {
     this.voices = speechSynthesis.getVoices().filter(v => /^en([-_]|$)/i.test(v.lang));
     fillVoiceSelect();
   },
+  /* Puntaje de naturalidad: premium/enhanced/neural > Google > voces buenas conocidas > resto; las "robóticas" al fondo. */
+  score(v) {
+    const n = v.name;
+    let sc = 0;
+    if (/premium|enhanced|neural|natural|siri/i.test(n)) sc += 100;
+    if (/^Google (US|UK) English/i.test(n)) sc += 70;
+    if (/^(Ava|Zoe|Evan|Allison|Nicky|Serena|Oliver|Daniel|Karen|Moira|Tessa|Kate|Susan|Tom|Jamie|Matilda|Isha|Rishi|Lee|Stephanie)\b/i.test(n)) sc += 45;
+    if (/^(Samantha|Alex)\b/i.test(n)) sc -= 20;
+    if (/^(Fred|Albert|Bad News|Bahh|Bells|Boing|Bubbles|Cellos|Deranged|Good News|Hysterical|Jester|Junior|Kathy|Organ|Princess|Ralph|Trinoids|Whisper|Wobble|Zarvox|Agnes|Vicki|Victoria|Superstar|Grandma|Grandpa|Eddy|Flo|Reed|Rocko|Sandy|Shelley)\b/i.test(n)) sc -= 200;
+    if (/en[-_]US/i.test(v.lang)) sc += 6; else if (/en[-_](GB|AU|IE|CA)/i.test(v.lang)) sc += 4;
+    if (v.localService) sc += 1;
+    return sc;
+  },
+  best(onlyLocal) {
+    const list = this.voices.filter(v => !onlyLocal || v.localService);
+    return list.slice().sort((a, b) => this.score(b) - this.score(a))[0] || null;
+  },
   pick() {
     const name = store.get('voice', null);
-    return this.voices.find(v => v.name === name)
-      || this.voices.find(v => v.localService && /en[-_]US/i.test(v.lang))
-      || this.voices.find(v => /en[-_]US/i.test(v.lang))
-      || this.voices[0] || null;
+    return (name && this.voices.find(v => v.name === name)) || this.best(false);
   },
-  speak(text, rate) {
+  speak(text, rate, _retry) {
     return new Promise(resolve => {
       if (!('speechSynthesis' in window)) { toast('Este navegador no tiene síntesis de voz', 'bad'); return resolve(); }
       speechSynthesis.cancel();
       const u = new SpeechSynthesisUtterance(text);
-      const v = this.pick();
+      const v = _retry || this.pick();
       if (v) { u.voice = v; u.lang = v.lang; } else u.lang = 'en-US';
-      u.rate = rate ?? store.get('rate', 1);
+      u.rate = rate ?? store.get('rate', 0.95);
+      u.pitch = 1;
       const keep = setInterval(markActive, 2000);
-      u.onend = u.onerror = () => { clearInterval(keep); resolve(); };
+      let started = false;
+      u.onstart = () => { started = true; };
+      u.onend = () => { clearInterval(keep); resolve(); };
+      u.onerror = () => {
+        clearInterval(keep);
+        if (!started && v && !v.localService && !_retry) {      // voz online sin internet → voz local
+          const loc = this.best(true); if (loc) return resolve(this.speak(text, rate, loc));
+        }
+        resolve();
+      };
       markActive();
       speechSynthesis.speak(u);
     });
   },
+  /* Reproducción automática: solo si el usuario activó el audio con el botón. */
+  auto(text, rate, delay = 0) {
+    if (!this.on) return;
+    if (delay) setTimeout(() => { if (this.on) this.speak(text, rate); }, delay); else this.speak(text, rate);
+  },
 };
 if ('speechSynthesis' in window) { TTS.load(); speechSynthesis.onvoiceschanged = () => TTS.load(); }
+{ // migración: antes se guardaba la voz por defecto (Samantha) como si la hubieras elegido
+  if (!store.get('voiceV2', false)) { try { localStorage.removeItem('voice'); } catch {} store.set('voiceV2', true); if (store.get('rate', 1) === 1) store.set('rate', 0.95); }
+}
+function renderAudioBtn() {
+  const b = $('#btnAudio'); if (!b) return;
+  b.textContent = TTS.on ? '🔊 Audio activado' : '🔇 Iniciar audio';
+  b.classList.toggle('on', TTS.on);
+}
+function audioToggle() {
+  TTS.on = !TTS.on; renderAudioBtn();
+  if (!TTS.on) { try { speechSynthesis.cancel(); } catch {} return; }
+  // al activar, reproducir lo que hay en pantalla
+  if (S.view === 1 && D.item) dictPlay();
+  else if (S.view === 2 && C.card && C.card.mode === 'new') TTS.speak(C.card.en.split('/')[0]);
+  else if (S.view === 4 && SH.item) TTS.speak(SH.item.text);
+}
 
 /* ==========================================================
    BLOQUE 1 · DICTADO ESTRICTO
@@ -1481,7 +1539,7 @@ async function dictNext() {
   $('#b1meta').innerHTML = `${D.item.review ? '<span class="badge">REPASO DE ERROR</span> ' : ''}${D.item.level} · ${esc(D.item.topic || '—')} · ${D.item.words} palabras · límite ${D.item.cap}`;
   updReplays();
   inp.focus();
-  setTimeout(() => dictPlay(), 350);
+  if (TTS.on) setTimeout(() => dictPlay(), 350);
 }
 
 function updReplays() {
@@ -1538,7 +1596,7 @@ async function dictCheck(reveal = false) {
 }
 
 $('#b1play').onclick = () => dictPlay();
-$('#b1slow').onclick = () => dictPlay(0.7);
+$('#b1slow').onclick = () => dictPlay(SLOW);
 $('#b1check').onclick = safe(() => dictCheck(false));
 $('#b1reveal').onclick = safe(() => dictCheck(true));
 $('#b1next').onclick = safe(dictNext);
@@ -1628,7 +1686,7 @@ async function trCheck(reveal = false) {
     + (r.lesson ? `<div class="gram"><b>${esc(r.lesson.title)}</b><code>${esc(r.lesson.formula)}</code></div>` : '');
   $('.say', res).onclick = () => TTS.speak(r.text);
   res.hidden = false;
-  TTS.speak(r.text);
+  TTS.auto(r.text);
 }
 
 $('#glDone').onclick = safe(lessonDone);
@@ -1660,7 +1718,7 @@ async function srsNext() {
     $('#b2es .say').onclick = () => TTS.speak(c.en.split('/')[0]);
     const cb = $('#b2ctx .say'); if (cb) cb.onclick = () => TTS.speak(c.context);
     inp.placeholder = 'Copiá la palabra en inglés para fijarla… Enter';
-    setTimeout(() => TTS.speak(c.en.split('/')[0]), 250);
+    TTS.auto(c.en.split('/')[0], undefined, 250);
   } else {
     $('#b2es').textContent = c.es;
     $('#b2ctx').innerHTML = c.context
@@ -1682,13 +1740,13 @@ async function srsEnter() {
     const r = await api('/api/srs/answer', { body: { id: C.card.id, answer: $('#b2input').value, ms, mode: C.card.mode } });
     C.answered = true; C.lastId = C.card.id;
     $('#b2input').readOnly = true;
-    if (r.verdict !== 'exact' && r.mode !== 'new') TTS.speak(r.en.split('/')[0]);
+    if (r.verdict !== 'exact' && r.mode !== 'new') TTS.auto(r.en.split('/')[0]);
     const VERD = { exact: '✓ Correcto', typo: '≈ Casi (typo)', wrong: '✗ Incorrecto', empty: '✗ En blanco' };
     if (r.mode === 'new') {
       $('#b2result').innerHTML = `<div class="verdict ${r.verdict === 'exact' || r.verdict === 'typo' ? 'exact' : 'wrong'}">${r.verdict === 'exact' ? '✓ Anotada' : r.verdict === 'typo' ? '≈ Casi: se escribe así' : '→ Se escribe así'}</div>
         <div class="big-en">${esc(r.en)}</div><p class="muted small">Vuelve en unos minutos para que la recuerdes sin ayuda · Enter para seguir</p>`;
       $('#b2result').hidden = false;
-      TTS.speak(r.en.split('/')[0]);
+      TTS.auto(r.en.split('/')[0]);
       return;
     }
     const next = r.mode === 'cram' ? 'modo extra: no altera la programación'
@@ -1838,7 +1896,7 @@ async function recToggle() {
 }
 
 $('#b3play').onclick = () => SH.item && TTS.speak(SH.item.text);
-$('#b3slow').onclick = () => SH.item && TTS.speak(SH.item.text, 0.7);
+$('#b3slow').onclick = () => SH.item && TTS.speak(SH.item.text, SLOW);
 $('#b3rec').onclick = safe(recToggle);
 $('#b3mine').onclick = () => { if (REC.wavUrl) { markActive(); new Audio(REC.wavUrl).play(); } };
 $('#b3next').onclick = safe(shadowNext);
@@ -1950,6 +2008,8 @@ $('#b4save').onclick = safe(readSave);
 $('#b4next').onclick = safe(readNext);
 
 /* ---------------------------------------------------------- atajos globales */
+$('#btnAudio').onclick = audioToggle;
+renderAudioBtn();
 addEventListener('keydown', e => {
   if (e.ctrlKey && e.code === 'Space') {
     e.preventDefault();
@@ -1999,26 +2059,30 @@ $('#statsClose').onclick = () => $('#dlgStats').close();
 
 /* ---------------------------------------------------------- ajustes */
 function fillVoiceSelect() {
-  const sel = $('#setVoice'); const cur = TTS.pick()?.name;
-  sel.innerHTML = TTS.voices.map(v => `<option value="${esc(v.name)}" ${v.name === cur ? 'selected' : ''}>
-    ${esc(v.name)} · ${esc(v.lang)} ${v.localService ? '(local)' : '(online)'}</option>`).join('') || '<option>Sin voces en inglés</option>';
+  const sel = $('#setVoice'); if (!sel) return;
+  const chosen = store.get('voice', '');
+  const sorted = TTS.voices.slice().sort((a, b) => TTS.score(b) - TTS.score(a));
+  const auto = TTS.best(false);
+  sel.innerHTML = `<option value="" ${chosen ? '' : 'selected'}>Automática → ${esc(auto ? auto.name : '—')}</option>` + sorted.map(v => `<option value="${esc(v.name)}" ${v.name === chosen ? 'selected' : ''}>
+    ${TTS.score(v) >= 70 ? '★ ' : ''}${esc(v.name)} · ${esc(v.lang)} ${v.localService ? '(local)' : '(online)'}</option>`).join('');
 }
 
 async function openSettings() {
   const s = await api('/api/settings');
   $('#setLevel').innerHTML = s.levels.map(l => `<option ${l === s.level ? 'selected' : ''}>${l}</option>`).join('');
   $('#setNew').value = s.new_per_day; $('#setHour').value = s.day_start_hour; $('#setCap').value = s.dict_cap;
-  const rate = store.get('rate', 1); $('#setRate').value = rate; $('#rateVal').textContent = `${rate}×`;
+  const rate = store.get('rate', 0.95); $('#setRate').value = rate; $('#rateVal').textContent = `${rate}×`;
   $('#importMsg').textContent = ''; $('#setImport').value = '';
   fillVoiceSelect();
   $('#dlgSettings').showModal();
 }
 $('#btnSettings').onclick = safe(openSettings);
 $('#setRate').oninput = e => { $('#rateVal').textContent = `${e.target.value}×`; };
+$('#setTest').onclick = () => { const n = $('#setVoice').value; const v = TTS.voices.find(x => x.name === n) || TTS.best(false); TTS.speak('Hello! This is how I sound. Practising a little every day makes a big difference.', +$('#setRate').value, v); };
 $('#setSave').onclick = safe(async e => {
   e.preventDefault();
   await api('/api/settings', { body: { level: $('#setLevel').value, new_per_day: +$('#setNew').value, day_start_hour: +$('#setHour').value, dict_cap: +$('#setCap').value } });
-  store.set('voice', $('#setVoice').value); store.set('rate', +$('#setRate').value);
+  store.set('voice', $('#setVoice').value || null); store.set('rate', +$('#setRate').value);
   $('#dlgSettings').close(); toast('Ajustes guardados', 'ok');
 });
 $('#setImport').onchange = safe(async e => {
@@ -2225,6 +2289,49 @@ const AB = {
     $('#abPick').hidden = !supported;
   },
 };
+
+/* ---------- espejo de seguridad del progreso (IndexedDB + archivo en la carpeta elegida) ---------- */
+const MIRROR = {
+  t1: null, t2: null, last: null, ok: true,
+  push(raw, saved) {
+    if (!raw) return;
+    this.last = raw; this.ok = saved;
+    clearTimeout(this.t1); this.t1 = setTimeout(() => AB.tx('kv', 'readwrite', o => o.put(raw, 'live')).catch(() => {}), 1500);
+    clearTimeout(this.t2); this.t2 = setTimeout(() => this.toFile(), 60000);
+  },
+  async toFile() {
+    try {
+      const h = await AB.getDir(); if (!h || !this.last) return;
+      if ((await h.queryPermission({ mode: 'readwrite' })) !== 'granted') return;
+      const fh = await h.getFileHandle('englishc2-progreso.json', { create: true });
+      const w = await fh.createWritable(); await w.write(this.last); await w.close();
+    } catch {}
+  },
+  async read() { try { const raw = await AB.tx('kv', 'readonly', o => o.get('live')); return raw ? JSON.parse(raw) : null; } catch { return null; } },
+};
+LocalAPI.setOnSave((raw, ok) => MIRROR.push(raw, ok));
+addEventListener('pagehide', () => { try { if (MIRROR.last) AB.tx('kv', 'readwrite', o => o.put(MIRROR.last, 'live')); } catch {} });
+async function recoverCheck() {
+  try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch {}
+  const cur = LocalAPI.current();
+  if (LocalAPI.progressOf(cur) > 0) return;
+  const m = await MIRROR.read();
+  if (!m || LocalAPI.progressOf(m) === 0) {
+    if ($('#abBanner')) return;
+    return;
+  }
+  const d = document.createElement('div'); d.id = 'recBanner'; d.className = 'ab-banner'; d.style.bottom = '120px';
+  d.innerHTML = `<span>Encontré progreso anterior (${LocalAPI.progressOf(m)} registros, guardado el ${new Date(m.saved_at || Date.now()).toLocaleString('es-AR')}). ¿Restaurarlo?</span> <button type="button">Restaurar</button> <button type="button" class="ghost">No</button>`;
+  d.querySelector('button').onclick = safe(async () => { await api('/api/restore', { body: m }); location.reload(); });
+  d.querySelectorAll('button')[1].onclick = () => d.remove();
+  document.body.appendChild(d);
+}
+async function freshHint() {
+  if (LocalAPI.progressOf(LocalAPI.current()) > 0 || store.get('freshHinted', false)) return;
+  store.set('freshHinted', true);
+  setTimeout(() => toast('Si ya estudiaste antes y no ves tu avance: abrí el archivo siempre con el MISMO navegador, o usá Ajustes → Restaurar desde archivo.'), 5000);
+}
+
 $('#btnBackup').onclick = safe(async () => {
   const r = await AB.run({ ask: true });
   toast('Backup hecho → ' + r.where.join(' + '), 'ok'); AB.status();
@@ -2262,6 +2369,7 @@ document.addEventListener('click', e => { if (e.target.closest('#btnSettings, [d
   setTimeout(() => AB.tick().catch(() => {}), 3000);
   setInterval(() => AB.tick().catch(() => {}), 3600000);
   AB.status();
+  recoverCheck().then(freshHint);
   await beat();
   setInterval(beat, BEAT_MS);
   setInterval(renderClock, 250);
