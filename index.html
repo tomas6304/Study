@@ -270,6 +270,9 @@ h4 { margin: 18px 0 8px; font-size: 15px; }
 .pr-sayrow { display: inline-flex; gap: 6px; align-items: center; margin: 3px 12px 3px 0; }
 .good-t { color: var(--ok); } .bad-t { color: var(--bad); }
 
+.lvbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 10px 0 0; padding: 8px 12px; border: 1px solid var(--border); border-radius: 12px; }
+.lvbar select, .lvbar input { padding: 4px 8px; }
+
 .ab-banner{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);background:var(--surface-2);border:1px solid var(--accent);border-radius:10px;padding:10px 14px;z-index:50;display:flex;gap:10px;align-items:center;font-size:14px}
 hr { border: 0; border-top: 1px solid var(--border); margin: 4px 0; width: 100%; }
 .filebtn { display: inline-flex !important; flex-direction: row !important; background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 9px 14px; cursor: pointer; }
@@ -296,6 +299,12 @@ hr { border: 0; border-top: 1px solid var(--border); margin: 4px 0; width: 100%;
 
 <nav class="blocks" id="blocks" aria-label="Bloques"></nav>
 
+<div id="lvBar" class="lvbar" hidden>
+  <span class="muted small">Dificultad de este bloque:</span>
+  <select id="lvLevel" title="Nivel"></select>
+  <select id="lvSpan" title="Amplitud"><option value="all">todo hasta ese nivel</option><option value="two">ese nivel y el anterior</option><option value="one">solo ese nivel</option></select>
+  <span id="lvCapWrap" hidden><label class="small muted">Largo máx. de frase <input id="lvCap" type="number" min="4" max="40" style="width:60px"></label></span>
+</div>
 <div class="clockbar">
   <div class="clock" id="clock">15:00</div>
   <div class="clock-info">
@@ -617,7 +626,12 @@ const LocalAPI = (() => {
   const diffDays = (a, b) => Math.round((parse(a) - parse(b)) / 86400000);
   const studyDay = () => fmt(new Date(Date.now() - DB.settings.day_start_hour * 3600000));
   const nowSec = () => Date.now() / 1000;
-  const levelsUpto = () => LEVELS.slice(0, LEVELS.indexOf(DB.settings.level) + 1);
+  /* Nivel por bloque: cada bloque puede tener su propio nivel y amplitud (todo hasta ese nivel / ese y el anterior / solo ese). */
+  let curBlock = 0;
+  const blCfg = (b = curBlock) => { const c = ((DB.settings.bl || {})[b]) || {};
+    return { level: LEVELS.includes(c.level) ? c.level : DB.settings.level, span: ['all', 'two', 'one'].includes(c.span) ? c.span : 'all' }; };
+  const levelsUpto = (b = curBlock) => { const { level, span } = blCfg(b), i = LEVELS.indexOf(level);
+    return LEVELS.slice(span === 'all' ? 0 : span === 'two' ? Math.max(0, i - 1) : i, i + 1); };
   const clean = s => { if (s === null || s === undefined) return null; s = String(s).replace(/\s+/g, ' ').trim(); return s || null; };
 
   /* ---------------------------------------------------------- texto */
@@ -692,7 +706,7 @@ const LocalAPI = (() => {
   }
   function stripAnswer(s) {
     const t = ntok(s);
-    while (t.length && ['to', 'a', 'an', 'the'].includes(t[0])) t.shift();
+    while (t.length > 1 && ['to', 'a', 'an', 'the'].includes(t[0])) t.shift();   // nunca vaciar: «the», «to», «a» son palabras válidas
     return t.join(' ');
   }
   function checkAnswer(answer, expected) {
@@ -770,9 +784,10 @@ const LocalAPI = (() => {
     const complete = current === null;
     if (complete && !DB.days[day]) DB.days[day] = new Date().toISOString();
     return { day, blocks, current, complete, block_seconds: BLOCK_SECONDS, streak: streak(),
-             day_index: dayIndex(), target_days: TARGET_DAYS, level: DB.settings.level, level_up: levelUpInfo() };
+             day_index: dayIndex(), target_days: TARGET_DAYS, level: DB.settings.level, bl: DB.settings.bl || {}, level_up: levelUpInfo() };
   }
   function requireBlock(n) {
+    curBlock = n;
     const st = getState();
     if (!st.complete && st.current !== n)
       throw new ApiError(409, `Bloque ${n} bloqueado. Terminá primero el bloque ${st.current} (${BLOCKS[st.current]}).`);
@@ -836,7 +851,7 @@ const LocalAPI = (() => {
   function pickSentence(type, sources, minW = 1, maxW = 60, noDigits = false, opts = {}) {
     const pool = poolFor(sources, minW, maxW, noDigits, opts.filter);
     if (opts.errType) { const r = dueError(opts.errType, pool); if (r) return r; }
-    const ranked = rankBy(type, pool, DB.settings.level);
+    const ranked = rankBy(type, pool, blCfg().level);
     const recent = nowSec() - 1800;
     const fresh = ranked.find(r => !r.s || r.s.last < recent);
     return (fresh || ranked[0] || {}).x || null;
@@ -1008,7 +1023,7 @@ const LocalAPI = (() => {
   const CONVO_PASS = 0.72, CONVO_GREAT = 0.92;
   R['GET /api/convo/next'] = (q) => {
     requireBlock(4);
-    const lv = levelsUpto(), cur = DB.settings.level;
+    const lv = levelsUpto(), cur = blCfg().level;
     const pool = (DB.convos || []).filter(c => lv.includes(c.level));
     if (!pool.length) throw new ApiError(404, 'No hay conversaciones. Importá un paquete de contenido.');
     const skip = new Set(String(q.skip || '').split(',').filter(Boolean));
@@ -1112,7 +1127,7 @@ const LocalAPI = (() => {
   R['GET /api/dictation/next'] = () => {
     requireBlock(1);
     const cap = DB.settings.dict_cap;
-    const s = pickSentence('dictation', ['dictation', 'grammar', 'idiom'], 1, cap, false, { errType: 'dictation' });
+    const s = pickSentence('dictation', ['dictation', 'grammar', 'idiom', 'reading'], 1, cap, false, { errType: 'dictation' });
     if (!s) throw new ApiError(404, 'No hay frases de dictado. Importá un paquete de contenido.');
     return { id: s.id, text: s.text, level: s.level, topic: s.topic, words: s.word_count, cap, max_tries: MAX_TRIES, review: !!s.review };
   };
@@ -1151,7 +1166,7 @@ const LocalAPI = (() => {
   const lessonByKey = k => (DB.lessons || []).find(L => L.key === k);
   const sentenceKey = s => { const g = s.grammar_id ? DB.grammar.find(x => x.id === s.grammar_id) : null; return g ? g.key : null; };
   function nextLesson() {
-    const lv = levelsUpto();
+    const lv = levelsUpto(3);
     return (DB.lessons || []).filter(L => lv.includes(L.level) && !DB.lessons_done[L.key]).sort((a, b) => a.order - b.order)[0] || null;
   }
   function lessonPayload(L, withAll = false) {
@@ -1170,7 +1185,7 @@ const LocalAPI = (() => {
       const focus = pool.filter(s => sentenceKey(s) === DB.focus_key && !DB.attempts.some(a => a.type === 'translate' && a.id === s.id && a.day === today));
       if (focus.length) return { ...focus[0], focus: true };
     }
-    const ranked = rankBy('translate', pool, DB.settings.level), recent = nowSec() - 1800;
+    const ranked = rankBy('translate', pool, blCfg(3).level), recent = nowSec() - 1800;
     const fresh = ranked.find(r => !r.s || r.s.last < recent);
     return (fresh || ranked[0] || {}).x || null;
   }
@@ -1220,7 +1235,7 @@ const LocalAPI = (() => {
   };
   R['GET /api/lessons'] = () => (DB.lessons || []).slice().sort((a, b) => a.order - b.order).map(L => ({
     key: L.key, title: L.title, level: L.level, order: L.order, done: !!DB.lessons_done[L.key],
-    unlocked: levelsUpto().includes(L.level) }));
+    unlocked: levelsUpto(3).includes(L.level) }));
   R['GET /api/lesson'] = q => { const L = lessonByKey(q.key); if (!L) throw new ApiError(404, 'Lección inexistente'); return lessonPayload(L, true); };
   R['GET /api/errors'] = () => {
     const today = studyDay();
@@ -1234,7 +1249,7 @@ const LocalAPI = (() => {
   };
 
   // ---- Bloque 2
-  const EXTRA_NEW = 40;       // palabras nuevas que se siguen ofreciendo después del cupo diario, si no queda nada que repasar
+  const EXTRA_NEW = 500;       // palabras nuevas que se siguen ofreciendo después del cupo diario, si no queda nada que repasar
   R['GET /api/srs/next'] = q => {
     requireBlock(2);
     const today = studyDay(), skip = Number(q.skip || 0), lv = levelsUpto(), audio = q.audio === '1';
@@ -1345,7 +1360,7 @@ const LocalAPI = (() => {
   R['GET /api/reading/next'] = () => {
     requireBlock(5);
     const lv = levelsUpto();
-    const ranked = rankBy('reading', DB.readings.filter(r => lv.includes(r.level)), DB.settings.level);
+    const ranked = rankBy('reading', DB.readings.filter(r => lv.includes(r.level)), blCfg().level);
     if (!ranked.length) throw new ApiError(404, 'No hay lecturas. Importá un paquete de contenido.');
     const r = ranked[0].x, st = ranked[0].s;
     const qs = DB.questions.filter(x => x.reading_id === r.id).map(x => ({ id: x.id, prompt: x.prompt, options: x.options }));
@@ -1412,6 +1427,10 @@ const LocalAPI = (() => {
     if ('level' in b) { if (!LEVELS.includes(b.level)) throw new ApiError(400, 'Nivel inválido'); DB.settings.level = b.level; }
     if ('new_per_day' in b) { const n = Number(b.new_per_day); if (!(n >= 0 && n <= 100)) throw new ApiError(400, 'Tarjetas nuevas: 0 a 100'); DB.settings.new_per_day = n; }
     if ('day_start_hour' in b) { const h = Number(b.day_start_hour); if (!(h >= 0 && h <= 12)) throw new ApiError(400, 'Hora de inicio: 0 a 12'); DB.settings.day_start_hour = h; }
+    if ('bl' in b) { const o = {}; for (const [k, v] of Object.entries(b.bl || {})) {
+        if (!['1', '2', '3', '4', '5'].includes(String(k)) || !v) continue;
+        o[k] = { level: LEVELS.includes(v.level) ? v.level : DB.settings.level, span: ['all', 'two', 'one'].includes(v.span) ? v.span : 'all' }; }
+      DB.settings.bl = { ...(DB.settings.bl || {}), ...o }; }
     if ('dict_cap' in b) { const c = Number(b.dict_cap); if (!(c >= CAP_MIN && c <= CAP_MAX)) throw new ApiError(400, `Longitud de frase: ${CAP_MIN} a ${CAP_MAX}`); DB.settings.dict_cap = c; DB.cap_window = []; }
     return { ...DB.settings, levels: LEVELS };
   };
@@ -1652,9 +1671,32 @@ function showBlock(n) {
   $('#vocab').hidden = true;
   $$('.panel').forEach(p => { p.hidden = true; });
   $('#b' + n).hidden = false;
-  if (n === 0) { loadDone(); return; }
+  if (n === 0) { $('#lvBar').hidden = true; loadDone(); return; }
+  renderLvBar(n);
   safe(LOADERS[n])();
 }
+
+/* Dificultad por bloque: cada bloque puede tener su propio nivel (p. ej. dictado en A1 y vocabulario en B1). */
+async function renderLvBar(n) {
+  const bar = $('#lvBar');
+  try {
+    const st = await api('/api/settings');
+    const c = (st.bl || {})[n] || {};
+    $('#lvLevel').innerHTML = st.levels.map(l => `<option ${l === (c.level || st.level) ? 'selected' : ''}>${l}</option>`).join('');
+    $('#lvSpan').value = c.span || 'all';
+    $('#lvCapWrap').hidden = n !== 1; if (n === 1) $('#lvCap').value = st.dict_cap;
+    bar.hidden = false; bar.dataset.n = n;
+  } catch { bar.hidden = true; }
+}
+async function lvChange() {
+  const n = Number($('#lvBar').dataset.n); if (!n) return;
+  const body = { bl: { [n]: { level: $('#lvLevel').value, span: $('#lvSpan').value } } };
+  if (n === 1) body.dict_cap = Math.max(4, Math.min(40, Number($('#lvCap').value) || 6));
+  await api('/api/settings', { body });
+  toast('Dificultad actualizada', 'ok');
+  C.lastId = 0; safe(LOADERS[n])();
+}
+$('#lvLevel').onchange = $('#lvSpan').onchange = $('#lvCap').onchange = safe(lvChange);
 
 /* ---------------------------------------------------------- TTS local */
 const SLOW = 0.5;                       // velocidad del botón "Lento"
